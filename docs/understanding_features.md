@@ -124,6 +124,32 @@ CUDA graph capture involves several initialization steps that happen lazily on t
 
 **Note**: The warm-up uses `max_graph_bs` (largest batch size) to ensure all initialization paths are exercised, since the largest graph will need the most resources.
 
+**TODO/Question: Is Warm-Up a Good Trade-Off?**
+
+While warm-up provides clear benefits, it's worth considering:
+
+1. **Resource Cost**: The warm-up captures and immediately destroys a full graph with `max_graph_bs`. This consumes:
+   - GPU memory (temporarily, until `del g`)
+   - GPU compute cycles (forward pass + capture overhead)
+   - Initialization time
+
+2. **Trade-Off Analysis**: 
+   - **Cost**: One extra graph capture (largest batch size) + deletion
+   - **Benefit**: Predictable, faster subsequent captures + accurate memory stats + early error detection
+   - **Question**: Does the one-time cost justify the benefits? Is there a measurable performance difference with vs. without warm-up?
+
+3. **Practical Safeguard**:
+   - **Early Failure Detection**: If initialization fails, it fails during warm-up (before real captures), making debugging easier
+   - **Memory State Consistency**: Ensures memory allocator is in a known state before measuring/allocating for real graphs
+   - **Production Reliability**: In production, one-time initialization cost is negligible compared to the reliability benefits
+
+4. **Alternative Approaches**:
+   - Could we skip warm-up and accept first-capture overhead?
+   - Could we use a smaller batch size for warm-up (faster but less thorough)?
+   - Are there benchmarks showing warm-up impact on total initialization time?
+
+**Investigation Needed**: Measure and document the actual cost/benefit of warm-up in practice. Is it a necessary safeguard or an optimization that could be optional?
+
 #### 1.4 Why Sort Batch Sizes in Descending Order? (Memory Pool Efficiency)
 
 This is a critical optimization! Let's understand why:

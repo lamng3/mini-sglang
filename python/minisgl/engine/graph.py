@@ -110,6 +110,8 @@ class GraphRunner:
         logger.info_rank0(f"Free GPU memory before capturing CUDA graphs: {mem_GB(free_memory)}")
 
         # warm up by capturing a graph and then destroying it
+        # 1. warm up is needed because several initialization steps happen lazily on the first capture
+        # 2. some CUDA kernels are JIT-compiled on first use, so warm up to avoid overhead
         g = torch.cuda.CUDAGraph()
         batch = Batch(reqs=[dummy_req] * self.max_graph_bs, phase="decode")
         attn_backend.prepare_for_capture(batch)
