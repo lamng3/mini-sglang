@@ -46,6 +46,9 @@ def get_free_memory(device: torch.device) -> int:
 
 
 class GraphRunner:
+    """
+        Capture CUDA graphs for different batch sizes and replay them later.
+    """
     def __init__(
         self,
         stream: torch.cuda.Stream,
@@ -58,26 +61,41 @@ class GraphRunner:
         max_seq_len: int,
         vocab_size: int,
         dummy_req: Req,
-    ):
+    ): 
+        # determine batch sizes to capture
         cuda_graph_bs = _determine_cuda_graph_bs(
-            cuda_graph_bs=cuda_graph_bs,
+            cuda_graph_bs=cuda_graph_bs, # e.g. [1, 2, 4, 8, 16] -- powers of 2
             cuda_graph_max_bs=cuda_graph_max_bs,
             free_memory=free_memory,
         )
+
+        # disable CUDA if no batch sizes to capture
         if len(cuda_graph_bs) == 0:
             logger.info_rank0("CUDA graph is disabled.")
             self.max_graph_bs = 0
             self.graph_map = {}
             return
 
+        # sort CUDA graph batch sizes in descending order for memory pool efficiency
+        # The first CUDA graph creates the memory pool (line 134), and subsequent
+        # graphs reuse it. Capturing largest first ensures the pool is sized
+        # optimally for all graphs.
         cuda_graph_bs = sorted(set(cuda_graph_bs), reverse=True)
+        
+        # max_graph_bs determines the size of the shared output tensor (self.logits).
+        # All graphs share this single tensor, using slicing (self.logits[:bs]) for
+        # different batch sizes. This avoids allocating separate tensors per graph.
         self.max_graph_bs = max(cuda_graph_bs)
+
+        # allocate output tensor for logits
         self.logits = torch.empty(
             (self.max_graph_bs, vocab_size),
             dtype=torch.float16,
             device=device,
         )
+
         self.attn_backend = attn_backend
+        # initialize attention backend for graph capture
         attn_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=cuda_graph_bs)
 
         torch.cuda.synchronize(device)
