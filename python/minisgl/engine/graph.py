@@ -83,7 +83,7 @@ class GraphRunner:
         cuda_graph_bs = sorted(set(cuda_graph_bs), reverse=True)
         
         # max_graph_bs determines the size of the shared output tensor (self.logits).
-        # All graphs share this single tensor, using slicing (self.logits[:bs]) for
+        # all graphs share this single tensor, using slicing (self.logits[:bs]) for
         # different batch sizes. This avoids allocating separate tensors per graph.
         self.max_graph_bs = max(cuda_graph_bs)
 
@@ -98,10 +98,13 @@ class GraphRunner:
         # initialize attention backend for graph capture
         attn_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=cuda_graph_bs)
 
+        # prepping stage
+        # synchronize and empty cache to ensure clean state for capturing graphs
         torch.cuda.synchronize(device)
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)
 
+        # start capturing graphs
         logger.info_rank0(f"Start capturing CUDA graphs with sizes: {cuda_graph_bs}")
         free_memory = get_free_memory(device)
         logger.info_rank0(f"Free GPU memory before capturing CUDA graphs: {mem_GB(free_memory)}")
@@ -124,6 +127,7 @@ class GraphRunner:
             disable=not get_tp_info().is_primary(),  # disable for non-primary ranks
         )
 
+        # create largest memory pool first and reuse for subsequent graphs
         pool = None
         for bs in pbar:
             free_memory = get_free_memory(device)
