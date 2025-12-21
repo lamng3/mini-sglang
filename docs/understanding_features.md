@@ -54,6 +54,42 @@ Token 1000: Forward pass (64 kernel launches, ~500μs GPU + ~500μs CPU overhead
 - **Optimize once**: CUDA optimizes the graph structure, kernel scheduling, memory access
 - **Store once**: Save the optimized execution plan
 
+**Where Optimization Happens (In Code):**
+```python
+# Location: python/minisgl/engine/graph.py:144-145
+
+with torch.cuda.graph(g, pool=pool, stream=stream):
+    self.logits[:bs] = model.forward()  # CUDA records and optimizes here
+```
+
+**Inside the `torch.cuda.graph()` context manager:**
+1. **Recording Phase**: CUDA records all GPU operations (kernels, memory transfers) executed inside the context
+2. **Optimization Phase**: CUDA runtime automatically optimizes:
+   - **Kernel scheduling**: Determines optimal execution order and overlap
+   - **Memory access patterns**: Optimizes memory coalescing and prefetching
+   - **Kernel fusion opportunities**: Identifies operations that can be merged
+   - **Register allocation**: Optimizes register usage across kernels
+   - **Pipeline optimization**: Overlaps computation and memory transfers
+3. **Storage**: The optimized execution plan is stored **inside the `g` object** (a `torch.cuda.CUDAGraph` instance)
+
+**Where the Optimized Plan is Stored (In Code):**
+```python
+# Location: python/minisgl/engine/graph.py:138, 148, 153
+
+g = torch.cuda.CUDAGraph()  # Create graph object
+# ... capture happens ...
+graph_list.append((bs, g))  # Store graph object
+self.graph_map = dict(graph_list)  # Map batch_size → optimized graph
+```
+
+**Storage Details:**
+- Each `torch.cuda.CUDAGraph` object (`g`) contains the optimized execution plan internally
+- The plan is stored in GPU memory and managed by CUDA runtime
+- `self.graph_map` (line 153) maps batch sizes to their corresponding optimized graphs
+- During replay, we retrieve the graph: `g = self.graph_map[batch.padded_size]` (line 163)
+
+**Note**: The optimization is done **automatically by CUDA runtime/driver** - PyTorch code doesn't explicitly call optimization functions. The optimization happens transparently when exiting the `torch.cuda.graph()` context manager.
+
 **CUDA Graph Replay:**
 - **Launch once**: Single CPU command launches the entire graph
 - **Execute efficiently**: GPU executes all kernels back-to-back without CPU intervention
@@ -161,14 +197,21 @@ for bs in cuda_graph_bs:
     # Capture the forward pass
     with get_global_ctx().forward_batch(batch):
         self.logits[:bs] = model.forward()  # Warm-up run
+        # CUDA OPTIMIZATION HAPPENS HERE:
+        # Inside this context, CUDA records all operations and optimizes them
         with torch.cuda.graph(g, pool=pool, stream=stream):
             self.logits[:bs] = model.forward()  # Actual capture
+        # When exiting context, CUDA:
+        # 1. Records all GPU operations that occurred
+        # 2. Optimizes kernel scheduling, memory access, fusion opportunities
+        # 3. Stores optimized execution plan inside 'g' object
     
     # Use memory pool for efficient memory reuse
     if pool is None:
         pool = g.pool()
     
-    graph_list.append((bs, g))
+    # STORAGE: Save the optimized graph (contains execution plan inside)
+    graph_list.append((bs, g))  # 'g' now contains the optimized execution plan
 ```
 
 **Key Points:**
@@ -415,16 +458,40 @@ GPU: Execute all kernels in sequence (pre-scheduled)
 
 **2. Pre-Compiled Execution Plan**
 
-During capture, CUDA:
-- Records the exact sequence of operations
-- Optimizes kernel launch parameters
-- Pre-determines memory access patterns
-- Creates an efficient execution schedule
+**Where Optimization Happens:**
+```python
+# Location: python/minisgl/engine/graph.py:144-145
+with torch.cuda.graph(g, pool=pool, stream=stream):
+    self.logits[:bs] = model.forward()  # Operations recorded here
+# CUDA optimizes when exiting this context manager
+```
 
-During replay, this optimized plan is executed directly without:
-- Re-evaluating which kernels to launch
-- Re-computing launch configurations
-- Re-determining execution order
+**During capture (inside `torch.cuda.graph()` context), CUDA:**
+- **Records** the exact sequence of operations (all kernels, memory transfers)
+- **Optimizes** kernel launch parameters (grid/block sizes, shared memory)
+- **Pre-determines** memory access patterns (coalescing, prefetching)
+- **Creates** an efficient execution schedule (kernel ordering, overlap)
+- **Stores** the optimized plan inside the `g` object (in GPU memory)
+
+**What CUDA Optimizes (Automatic, Inside CUDA Runtime):**
+- **Kernel Scheduling**: Optimal execution order and overlap opportunities
+- **Memory Coalescing**: Grouping memory accesses for efficiency
+- **Kernel Fusion**: Identifying operations that can be merged
+- **Register Allocation**: Efficient register usage across kernels
+- **Pipeline Optimization**: Overlapping computation and memory transfers
+- **Stream Synchronization**: Minimizing synchronization overhead
+
+**Storage Location:**
+```python
+# Location: python/minisgl/engine/graph.py:153
+self.graph_map = dict(graph_list)  # Maps batch_size → optimized graph object
+# Each graph object 'g' contains the optimized execution plan internally
+```
+
+**During replay, this optimized plan is executed directly without:**
+- Re-evaluating which kernels to launch (plan is pre-determined)
+- Re-computing launch configurations (parameters are pre-optimized)
+- Re-determining execution order (schedule is pre-computed)
 
 **3. Reduced Synchronization Points**
 
