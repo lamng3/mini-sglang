@@ -7,6 +7,119 @@ This document provides a detailed walkthrough of three critical features in Mini
 ### Overview
 CUDA graphs minimize CPU launch overhead during the decode phase by pre-capturing GPU operations and replaying them. This is especially important for small batch sizes where CPU overhead can dominate.
 
+### Motivation: Why Capture and Replay CUDA Graphs?
+
+#### The Fundamental Problem
+
+**LLM inference, especially the decode phase, is highly repetitive:**
+- Same sequence of operations: embedding → transformer layers → LM head
+- Same kernel launches: attention, matrix multiplications, activations
+- Same memory access patterns: KV cache reads, weight accesses
+- **This repetition happens thousands of times per second** during serving
+
+**The CPU Launch Overhead Bottleneck:**
+
+In traditional GPU execution, each kernel launch requires:
+1. **CPU-GPU Communication**: CPU sends launch command to GPU driver
+2. **Driver Processing**: GPU driver processes the launch request
+3. **Kernel Scheduling**: GPU scheduler queues the kernel
+4. **Synchronization**: CPU may wait for completion before launching next kernel
+
+For a typical LLM forward pass with 32 layers:
+- **Normal execution**: ~64-128 kernel launches (2-4 per layer)
+- **Each launch**: ~5-20μs CPU overhead
+- **Total CPU overhead**: ~320-2560μs (0.3-2.6ms) per forward pass
+- **For batch_size=1 decode**: CPU overhead can be **50-80% of total latency**
+
+**The Repetition Problem:**
+
+During decode phase, we generate tokens one at a time:
+```
+Token 1: Forward pass (64 kernel launches, ~500μs GPU + ~500μs CPU overhead)
+Token 2: Forward pass (64 kernel launches, ~500μs GPU + ~500μs CPU overhead)
+Token 3: Forward pass (64 kernel launches, ~500μs GPU + ~500μs CPU overhead)
+...
+Token 1000: Forward pass (64 kernel launches, ~500μs GPU + ~500μs CPU overhead)
+```
+
+**The same 64 kernels are launched 1000 times!** The CPU is doing redundant work:
+- Re-evaluating which kernels to launch (even though it's always the same)
+- Re-computing launch parameters (even though they're predictable)
+- Re-synchronizing between kernels (even though the sequence is fixed)
+
+#### The Solution: Capture Once, Replay Many Times
+
+**CUDA Graph Capture:**
+- **Record once**: During initialization, capture the entire forward pass as a graph
+- **Optimize once**: CUDA optimizes the graph structure, kernel scheduling, memory access
+- **Store once**: Save the optimized execution plan
+
+**CUDA Graph Replay:**
+- **Launch once**: Single CPU command launches the entire graph
+- **Execute efficiently**: GPU executes all kernels back-to-back without CPU intervention
+- **Repeat efficiently**: Replay the same optimized graph thousands of times
+
+**The Key Insight:**
+
+Since decode phase is **predictable and repetitive**, we can:
+1. **Pay the capture cost once** (during initialization, ~100-500ms)
+2. **Amortize over thousands of replays** (each replay saves ~200-500μs)
+3. **Break-even point**: After ~200-2500 replays, we've saved more time than capture cost
+4. **In production**: Millions of replays → massive time savings
+
+#### Why This Matters for LLM Serving
+
+**1. Latency Reduction:**
+- **User-facing**: Lower latency = better user experience
+- **Interactive applications**: Chat, code completion, real-time generation
+- **Time-to-first-token**: Critical for streaming responses
+
+**2. Throughput Improvement:**
+- **More requests per second**: CPU can handle more concurrent requests
+- **Better GPU utilization**: Less CPU waiting = more GPU computation
+- **Scalability**: System can serve more users with same hardware
+
+**3. Cost Efficiency:**
+- **Lower infrastructure costs**: Same hardware handles more load
+- **Energy efficiency**: Less CPU-GPU communication = lower power consumption
+- **Resource optimization**: Better utilization of expensive GPU resources
+
+**4. Production Reliability:**
+- **Predictable performance**: Consistent latency (no first-capture overhead)
+- **Better resource planning**: Known memory and compute requirements
+- **Easier debugging**: Graph structure is fixed and inspectable
+
+#### Historical Context
+
+Before CUDA graphs (CUDA 10.0, 2018), LLM serving faced a fundamental bottleneck:
+- **Small batch inference was slow**: CPU overhead dominated
+- **Throughput was limited**: CPU couldn't keep GPU busy
+- **Latency was high**: Multiple sync points added up
+
+CUDA graphs revolutionized LLM serving by:
+- **Enabling efficient small-batch inference**: Now practical for interactive applications
+- **Unlocking high-throughput serving**: CPU can handle many concurrent requests
+- **Making real-time generation feasible**: Low latency enables streaming
+
+#### The Trade-Off: When to Use CUDA Graphs
+
+**✅ Perfect for:**
+- **Decode phase**: Highly repetitive, predictable structure
+- **Small batches**: Where CPU overhead dominates
+- **Production serving**: High repetition, performance critical
+- **Fixed model structure**: Same operations every time
+
+**❌ Not ideal for:**
+- **Prefill phase**: Variable sequence lengths, less repetitive
+- **Large batches**: GPU computation dominates, CPU overhead is negligible
+- **Dynamic control flow**: Operations that change based on input
+- **One-off inference**: Not worth capture cost
+
+**In Mini-SGLang:**
+- CUDA graphs are used **only for decode phase** (batch_size ≤ max_graph_bs)
+- Prefill uses normal forward pass (variable lengths, less repetitive)
+- This hybrid approach maximizes benefits while minimizing costs
+
 ### Key Files
 - **`python/minisgl/engine/graph.py`**: Main CUDA graph implementation
 - **`python/minisgl/engine/engine.py`**: Integration with the engine
