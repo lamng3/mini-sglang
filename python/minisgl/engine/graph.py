@@ -77,9 +77,9 @@ class GraphRunner:
             return
 
         # sort CUDA graph batch sizes in descending order for memory pool efficiency
-        # The first CUDA graph creates the memory pool (line 134), and subsequent
-        # graphs reuse it. Capturing largest first ensures the pool is sized
-        # optimally for all graphs.
+        # first CUDA graph creates memory pool and subsequent graphs reuse it.
+        # capturing largest first ensures the pool is sized optimally for all graphs.
+        # more details in https://github.com/Dao-AILab/flash-attention/blob/master/docs/advanced/cuda_graphs.md#memory-pool-management
         cuda_graph_bs = sorted(set(cuda_graph_bs), reverse=True)
         
         # max_graph_bs determines the size of the shared output tensor (self.logits).
