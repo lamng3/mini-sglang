@@ -63,7 +63,68 @@ for bs in cuda_graph_bs:
 - **Dummy Requests**: Uses dummy requests with fixed shapes for capture
 - **Decode Phase Only**: CUDA graphs are only used for decode (not prefill)
 
-#### 1.3 Why Sort Batch Sizes in Descending Order? (Memory Pool Efficiency)
+#### 1.3 Why Warm-Up? (Capture and Destroy Before Real Capture)
+
+Before capturing the graphs we actually want to keep, there's a warm-up step:
+
+```python
+# Location: python/minisgl/engine/graph.py:109-117
+
+# Warm up by capturing a graph and then destroying it
+g = torch.cuda.CUDAGraph()
+batch = Batch(reqs=[dummy_req] * self.max_graph_bs, phase="decode")
+attn_backend.prepare_for_capture(batch)
+with get_global_ctx().forward_batch(batch):
+    self.logits[:] = model.forward()
+    with torch.cuda.graph(g, stream=stream):
+        self.logits[:] = model.forward()
+del g  # Destroy the warm-up graph
+```
+
+**Why Do This?**
+
+CUDA graph capture involves several initialization steps that happen lazily on the first capture:
+
+1. **CUDA Runtime Initialization**: The first time you call `torch.cuda.graph()`, CUDA may need to:
+   - Initialize internal data structures
+   - Set up graph capture infrastructure
+   - Allocate internal buffers for tracking operations
+
+2. **Kernel Compilation**: Some CUDA kernels might be JIT-compiled on first use:
+   - FlashAttention kernels
+   - Custom CUDA operations
+   - Memory allocation routines
+
+3. **Memory Allocator Warm-Up**: CUDA's memory allocator may:
+   - Initialize allocation pools
+   - Establish memory fragmentation patterns
+   - Cache allocation strategies
+
+4. **PyTorch Internal State**: PyTorch's CUDA graph support may:
+   - Initialize operation tracking
+   - Set up memory mapping for captured operations
+   - Prepare synchronization primitives
+
+**Benefits of Warm-Up:**
+
+✅ **Predictable Performance**: The actual capture loop has consistent timing (no first-capture overhead)
+
+✅ **Consistent Memory State**: Memory allocator is in a "steady state" before real captures
+
+✅ **Accurate Memory Measurements**: After warm-up, memory stats reflect the true state (see `reset_peak_memory_stats` on line 103)
+
+✅ **Faster Capture Loop**: All lazy initialization is done, so the real captures are faster
+
+✅ **Better Error Handling**: If there are any initialization issues, they surface during warm-up rather than during the real capture loop
+
+**What Happens:**
+1. **Warm-up capture** (lines 109-116): Captures a graph with maximum batch size, then immediately deletes it
+2. **Memory cleanup** (line 117): `del g` frees the warm-up graph, but leaves CUDA runtime initialized
+3. **Real captures** (lines 127-139): All subsequent captures benefit from the warm-up initialization
+
+**Note**: The warm-up uses `max_graph_bs` (largest batch size) to ensure all initialization paths are exercised, since the largest graph will need the most resources.
+
+#### 1.4 Why Sort Batch Sizes in Descending Order? (Memory Pool Efficiency)
 
 This is a critical optimization! Let's understand why:
 
@@ -135,7 +196,7 @@ for bs in cuda_graph_bs:  # Iterate largest to smallest
 - **Performance**: Avoiding pool resizes saves significant time during initialization
 - **Reliability**: Prevents potential out-of-memory errors from pool expansion failures
 
-#### 1.4 Attention Backend Integration
+#### 1.5 Attention Backend Integration
 
 The attention backend prepares metadata for capture and replay:
 
@@ -159,7 +220,7 @@ def prepare_for_replay(self, batch: Batch):
     # ... copy other metadata
 ```
 
-#### 1.5 Replay During Inference
+#### 1.6 Replay During Inference
 
 During actual inference, the engine checks if CUDA graph can be used:
 
