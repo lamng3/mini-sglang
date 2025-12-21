@@ -195,10 +195,13 @@ class Engine:
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        # during inference, engine checks if CUDA graph can be used
         with self.ctx.forward_batch(batch):
             if self.graph_runner.can_use_cuda_graph(batch):
+                # if yes, use CUDA graph replay (fast!)
                 logits = self.graph_runner.replay(batch)
             else:
+                # if no, use normal forward pass
                 logits = self.model.forward()
 
         for req in batch.reqs:

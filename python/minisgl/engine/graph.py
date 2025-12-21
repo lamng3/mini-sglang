@@ -159,8 +159,11 @@ class GraphRunner:
 
     def replay(self, batch: Batch) -> torch.Tensor:
         assert self.can_use_cuda_graph(batch)
+        # get graph for this batch size
         g = self.graph_map[batch.padded_size]
+        # update capture tensors for replay
         self.attn_backend.prepare_for_replay(batch)
+        # replay the captured graph
         g.replay()
         return self.logits[: batch.size]
 
@@ -170,6 +173,7 @@ class GraphRunner:
         gc.collect()
 
     def pad_batch(self, batch: Batch) -> int:
+        # if actual batch size is 3, it is padded to 4 to use the graph for batch size 4
         padded_size = (  # choose the first available batch size
             next(bs for bs in self.graph_bs_list if bs >= batch.size)
             if self.can_use_cuda_graph(batch)

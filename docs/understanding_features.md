@@ -275,6 +275,109 @@ def replay(self, batch: Batch) -> torch.Tensor:
     return self.logits[:batch.size]
 ```
 
+#### Why Is CUDA Graph Replay Fast?
+
+CUDA graph replay (`g.replay()`) is significantly faster than a normal forward pass for several reasons:
+
+**1. Eliminates CPU Launch Overhead**
+
+**Normal Forward Pass:**
+```
+CPU: Launch kernel 1 → Wait → Launch kernel 2 → Wait → Launch kernel 3 → ...
+     [CPU-GPU sync]      [CPU-GPU sync]      [CPU-GPU sync]
+```
+- Each kernel launch requires CPU-GPU communication
+- CPU must wait for GPU to be ready before launching next kernel
+- High latency for small batch sizes (CPU overhead dominates)
+
+**CUDA Graph Replay:**
+```
+CPU: Launch entire graph once → Done
+     [Single CPU-GPU sync]
+GPU: Execute all kernels in sequence (pre-scheduled)
+```
+- Single launch command for the entire computation graph
+- GPU executes all kernels back-to-back without CPU intervention
+- Minimal CPU involvement after the initial launch
+
+**2. Pre-Compiled Execution Plan**
+
+During capture, CUDA:
+- Records the exact sequence of operations
+- Optimizes kernel launch parameters
+- Pre-determines memory access patterns
+- Creates an efficient execution schedule
+
+During replay, this optimized plan is executed directly without:
+- Re-evaluating which kernels to launch
+- Re-computing launch configurations
+- Re-determining execution order
+
+**3. Reduced Synchronization Points**
+
+**Normal Forward Pass:**
+- Each layer may require synchronization
+- CPU checks completion before launching next operation
+- Multiple CPU-GPU round trips
+
+**CUDA Graph Replay:**
+- All operations are pre-scheduled
+- GPU executes continuously without CPU checks
+- Single synchronization point at the end
+
+**4. Kernel Fusion Opportunities**
+
+CUDA can optimize the entire graph as a unit:
+- **Kernel Merging**: Adjacent operations can be fused into single kernels
+- **Memory Coalescing**: Better memory access patterns across the graph
+- **Register Optimization**: More efficient register usage across kernels
+- **Pipeline Optimization**: Better overlap of computation and memory transfers
+
+**5. Better Memory Access Patterns**
+
+- **Prefetching**: CUDA can prefetch data for upcoming kernels
+- **Locality**: Memory accesses are known in advance, enabling better caching
+- **Reduced Memory Fragmentation**: Pre-allocated memory pool reduces allocation overhead
+- **Cache Efficiency**: Predictable access patterns improve GPU cache hit rates
+
+**6. Lower Latency for Small Batches**
+
+This is especially critical for decode phase (batch size = 1):
+- **Normal forward**: CPU overhead can be 50-80% of total time for batch_size=1
+- **Graph replay**: CPU overhead is minimal (~5-10% of total time)
+- **Result**: 2-5x speedup for small batch inference
+
+**Performance Comparison:**
+
+```
+Normal Forward Pass (batch_size=1):
+├─ CPU launch overhead: ~200-500μs
+├─ GPU computation: ~500-1000μs
+└─ Total: ~700-1500μs
+
+CUDA Graph Replay (batch_size=1):
+├─ CPU launch overhead: ~10-50μs
+├─ GPU computation: ~500-1000μs (same)
+└─ Total: ~510-1050μs
+
+Speedup: 1.4x - 2.9x for small batches
+```
+
+**Why This Matters for LLM Serving:**
+
+- **High Throughput**: Decode phase runs thousands of times per second
+- **Low Latency**: Every microsecond saved improves user experience
+- **Scalability**: Lower CPU overhead means CPU can handle more concurrent requests
+- **Resource Efficiency**: More GPU utilization, less CPU waiting
+
+**Trade-Off:**
+
+- **Memory**: CUDA graphs consume GPU memory (but shared pool minimizes this)
+- **Flexibility**: Graph structure is fixed (but decode phase is predictable)
+- **Initialization**: One-time capture cost (but amortized over many replays)
+
+For decode-phase inference (which is highly repetitive), the benefits far outweigh the costs.
+
 **Why Batch Padding?**
 - CUDA graphs are captured for specific batch sizes (e.g., 1, 2, 4, 8, ...)
 - If actual batch size is 3, it's padded to 4 to use the graph for batch size 4

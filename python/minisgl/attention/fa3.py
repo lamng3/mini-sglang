@@ -113,8 +113,12 @@ class FlashAttentionBackend(BaseAttnBackend):
         self.capture_bs = sorted(bs_list)
 
     def prepare_for_capture(self, batch: Batch) -> None:
+        """
+        prepares metadata for capture and replay
+        """
         assert (bs := batch.size) in self.capture_bs and self.capture
         capture = self.capture
+        # set up metadata using pre-allocated capture tensors
         metadata = FA3Metadata(
             cu_seqlens_k=capture.cu_seqlens_k[: bs + 1],
             cu_seqlens_q=capture.cu_seqlens_q[: bs + 1],
@@ -124,6 +128,7 @@ class FlashAttentionBackend(BaseAttnBackend):
             max_seqlen_q=1,  # decode only
             page_table=capture.page_table[:bs, :],
         )
+        # store data in batch for replay
         batch.attn_metadata = metadata
         batch.input_ids = capture.input_ids[:bs]
         batch.out_loc = capture.out_loc[:bs]
@@ -132,6 +137,7 @@ class FlashAttentionBackend(BaseAttnBackend):
         metadata, bs = batch.attn_metadata, batch.padded_size
         assert isinstance(metadata, FA3Metadata)
         assert self.capture is not None and bs in self.capture_bs
+        # copy data from batch to capture tensors for replay
         # cu_seqlens_q is always [0, 1, 2, ..., bs] for decode (i.e. no-op)
         self.capture.input_ids[:bs].copy_(batch.input_ids)
         self.capture.out_loc[:bs].copy_(batch.out_loc)
