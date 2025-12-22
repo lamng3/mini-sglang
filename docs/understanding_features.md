@@ -206,9 +206,12 @@ for bs in cuda_graph_bs:
         # 2. Optimizes kernel scheduling, memory access, fusion opportunities
         # 3. Stores optimized execution plan inside 'g' object
     
-    # Use memory pool for efficient memory reuse
+    # MEMORY POOL MECHANISM:
+    # If pool is None (first graph), create a new memory pool from this graph
+    # If pool exists (subsequent graphs), reuse the existing pool
     if pool is None:
-        pool = g.pool()
+        pool = g.pool()  # Extract memory pool from first graph (largest batch size)
+        # This pool is sized for the largest graph and can accommodate smaller graphs
     
     # STORAGE: Save the optimized graph (contains execution plan inside)
     graph_list.append((bs, g))  # 'g' now contains the optimized execution plan
@@ -218,6 +221,124 @@ for bs in cuda_graph_bs:
 - **Memory Pool**: All graphs share a memory pool (`pool`) to reuse memory efficiently
 - **Dummy Requests**: Uses dummy requests with fixed shapes for capture
 - **Decode Phase Only**: CUDA graphs are only used for decode (not prefill)
+
+#### Understanding `torch.cuda.CUDAGraph()` and `torch.cuda.graph()`
+
+These are the two key PyTorch APIs for CUDA graph functionality:
+
+**1. `torch.cuda.CUDAGraph()` - The Graph Object**
+
+```python
+# Location: python/minisgl/engine/graph.py:138
+g = torch.cuda.CUDAGraph()
+```
+
+**What it is:**
+- A Python object that represents a CUDA graph
+- Created **before** capture to hold the graph structure
+- Initially empty - gets populated during capture
+
+**What it stores (after capture):**
+- **Optimized execution plan**: Sequence of GPU operations (kernels, memory transfers)
+- **Kernel launch parameters**: Pre-computed grid/block sizes, shared memory configs
+- **Memory addresses**: Fixed pointers to input/output tensors
+- **Synchronization points**: Pre-determined sync locations
+- **Memory pool reference**: Link to shared memory pool (if used)
+
+**Key methods:**
+- `g.pool()`: Returns the memory pool associated with this graph (used for sharing)
+- `g.replay()`: Executes the captured graph (fast replay)
+
+**2. `torch.cuda.graph()` - The Capture Context Manager**
+
+```python
+# Location: python/minisgl/engine/graph.py:151
+with torch.cuda.graph(g, pool=pool, stream=stream):
+    self.logits[:bs] = model.forward()
+```
+
+**What it does:**
+- **Context manager** that captures GPU operations
+- Records all operations executed inside the context
+- Optimizes the recorded operations
+- Stores the optimized plan in the `g` object
+
+**Parameters:**
+- `g`: The `CUDAGraph` object to populate
+- `pool`: Optional memory pool for sharing memory across graphs
+- `stream`: CUDA stream to execute operations on
+
+**Inside the context manager:**
+1. **Recording Phase**: All GPU operations are recorded (not executed immediately)
+   - Kernel launches (matrix ops, attention, activations)
+   - Memory transfers (H2D, D2H, D2D)
+   - Synchronization points
+2. **Optimization Phase** (when exiting context):
+   - CUDA runtime analyzes the recorded operations
+   - Optimizes kernel scheduling and ordering
+   - Identifies memory access patterns
+   - Finds fusion opportunities
+   - Creates efficient execution plan
+3. **Storage Phase**: Optimized plan stored in `g` object
+
+**Memory Pool Mechanism:**
+
+```python
+# Location: python/minisgl/engine/graph.py:133, 159-160
+
+pool = None  # Start with no pool
+for bs in cuda_graph_bs:  # Iterate largest to smallest
+    g = torch.cuda.CUDAGraph()
+    
+    with torch.cuda.graph(g, pool=pool, stream=stream):
+        # Capture operations...
+    
+    if pool is None:
+        # FIRST GRAPH (largest batch size):
+        # - Creates a new memory pool sized for this graph
+        # - Pool is stored inside 'g' object
+        pool = g.pool()  # Extract the pool for reuse
+    # SUBSEQUENT GRAPHS (smaller batch sizes):
+    # - Reuse the existing 'pool' from first graph
+    # - All graphs share the same memory pool
+```
+
+**Why this works:**
+- **First graph** (`pool=None`): CUDA creates a memory pool sized for the largest graph
+- **Subsequent graphs** (`pool=existing_pool`): Reuse the same pool (smaller graphs fit inside)
+- **Result**: All graphs share one large memory pool, avoiding fragmentation
+
+**Deep Dive: How CUDA Optimization Happens**
+
+The optimization happens **inside CUDA runtime/driver**, not in PyTorch code. When you exit the `torch.cuda.graph()` context:
+
+1. **Graph Construction**:
+   - CUDA builds a DAG (Directed Acyclic Graph) of operations
+   - Nodes = operations (kernels, memcpy)
+   - Edges = dependencies (data flow, synchronization)
+
+2. **Static Analysis**:
+   - Analyzes memory access patterns
+   - Identifies read-after-write, write-after-read dependencies
+   - Determines which operations can run in parallel
+
+3. **Optimization Passes**:
+   - **Kernel Scheduling**: Reorders kernels for better GPU utilization
+   - **Memory Coalescing**: Groups memory accesses for efficiency
+   - **Kernel Fusion**: Merges adjacent operations when possible
+   - **Register Allocation**: Optimizes register usage across kernels
+   - **Pipeline Optimization**: Overlaps computation and memory transfers
+
+4. **Code Generation**:
+   - Generates optimized execution plan
+   - Pre-computes launch parameters
+   - Creates efficient kernel launch sequence
+
+5. **Storage**:
+   - Stores plan in GPU memory (inside `g` object)
+   - Plan is a compact representation of the optimized execution
+
+**Note**: The actual optimization algorithms are proprietary CUDA runtime implementations. PyTorch provides the interface (`torch.cuda.graph()`), but CUDA does the heavy lifting.
 
 #### 1.3 Why Warm-Up? (Capture and Destroy Before Real Capture)
 

@@ -194,6 +194,9 @@ class Engine:
         return min_free_memory, max_free_memory
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
+        """
+        CUDA graphs are only used for decode (not prefill).
+        """
         assert torch.cuda.current_stream() == self.stream
         # during inference, engine checks if CUDA graph can be used
         with self.ctx.forward_batch(batch):

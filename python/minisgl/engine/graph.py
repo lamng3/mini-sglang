@@ -136,15 +136,31 @@ class GraphRunner:
             pbar.desc = f"Capturing graphs: bs = {bs:<3} | avail_mem = {mem_GB(free_memory)}"
             pbar.refresh()
             g = torch.cuda.CUDAGraph()
+            
             if bs != self.max_graph_bs:
+                # prepare batch with dummy requests
+                # use dummy reques with fixed shapes for capture
                 batch = Batch(reqs=[dummy_req] * bs, phase="decode")
                 self.attn_backend.prepare_for_capture(batch)
+            
+            # capture the forward pass
             with get_global_ctx().forward_batch(batch):
-                self.logits[:bs] = model.forward()
+                self.logits[:bs] = model.forward() # warm-up run
+
+                # CUDA OPTIMIZATION HAPPENS HERE:
+                # inside this context, CUDA records all operations and optimizes them
                 with torch.cuda.graph(g, pool=pool, stream=stream):
                     self.logits[:bs] = model.forward()
+                # when exiting context, CUDA:
+                # 1. records all GPU operations that occurred
+                # 2. optimizes kernel scheduling, memory access, fusion opportunities
+                # 3. stores optimized execution plan inside 'g' object
+
+            # use memory pool for efficient memory reuse
+            # all graphs share a memory pool 'pool' to reuse memory efficeintly
             if pool is None:
-                pool = g.pool()
+                pool = g.pool() # if None, get from first graph
+            # save the optimized graph containing execution plan inside
             graph_list.append((bs, g))
 
         free_memory = get_free_memory(device)
@@ -158,7 +174,7 @@ class GraphRunner:
         return batch.is_decode and batch.size <= self.max_graph_bs
 
     def replay(self, batch: Batch) -> torch.Tensor:
-        assert self.can_use_cuda_graph(batch)
+        assert self.can_use_cuda_graph(batch) 
         # get graph for this batch size
         g = self.graph_map[batch.padded_size]
         # update capture tensors for replay
