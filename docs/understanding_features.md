@@ -340,6 +340,247 @@ The optimization happens **inside CUDA runtime/driver**, not in PyTorch code. Wh
 
 **Note**: The actual optimization algorithms are proprietary CUDA runtime implementations. PyTorch provides the interface (`torch.cuda.graph()`), but CUDA does the heavy lifting.
 
+#### PyTorch Implementation Details
+
+**Reference**: [PyTorch CUDA Graphs Source Code](https://github.com/pytorch/pytorch/blob/v2.9.1/torch/cuda/graphs.py)
+
+**How `torch.cuda.graph()` Works Internally:**
+
+The `torch.cuda.graph()` context manager (implemented in PyTorch's `torch.cuda.graphs.graph` class) is a high-level wrapper around CUDA's graph capture APIs:
+
+```python
+# PyTorch implementation (simplified)
+class graph:
+    def __enter__(self):
+        # Calls capture_begin() on the CUDAGraph object
+        self.cuda_graph.capture_begin(pool=self.pool, ...)
+        return self
+    
+    def __exit__(self, ...):
+        # Calls capture_end() on the CUDAGraph object
+        self.cuda_graph.capture_end()
+```
+
+**Internal Flow:**
+
+1. **`__enter__` (Context Entry)**:
+   - Calls `g.capture_begin(pool=pool, stream=stream, capture_error_mode=...)`
+   - This internally calls CUDA's `cudaStreamBeginCapture()`
+   - CUDA starts recording all operations on the specified stream
+
+2. **Operations Inside Context**:
+   - All GPU operations are intercepted and recorded
+   - Operations are NOT executed immediately (deferred execution)
+   - CUDA builds an internal representation of the computation graph
+
+3. **`__exit__` (Context Exit)**:
+   - Calls `g.capture_end()`
+   - This internally calls CUDA's `cudaStreamEndCapture()`
+   - CUDA finalizes the graph and optimizes it
+   - Creates `cudaGraphExec_t` (executable graph) from `cudaGraph_t` (graph structure)
+
+**Key PyTorch Implementation Details:**
+
+**1. Stream Handling:**
+```python
+# From PyTorch source (line ~184)
+# If stream is not supplied, graph sets its own internal side stream
+if stream is None:
+    stream = torch.cuda.Stream()  # Internal side stream
+```
+
+**2. Memory Pool (`pool` parameter):**
+- `pool` is an opaque token (`_POOL_HANDLE`) representing a memory pool ID
+- When `pool=None`: CUDA creates a new memory pool for this graph
+- When `pool=existing_pool`: CUDA reuses the specified memory pool
+- The pool is managed by CUDA runtime, not PyTorch
+
+**3. Capture Error Mode:**
+- `capture_error_mode`: Controls behavior during capture
+  - `"global"`: Errors on unsafe actions in any thread
+  - `"thread_local"`: Only errors for current thread
+  - `"relaxed"`: No errors (may cause issues)
+- Default is `"global"` for safety
+
+**4. Underlying CUDA APIs:**
+
+PyTorch's `CUDAGraph` class wraps CUDA's native graph APIs:
+- `cudaStreamBeginCapture()` → `capture_begin()`
+- `cudaStreamEndCapture()` → `capture_end()`
+- `cudaGraphInstantiate()` → `instantiate()` (called automatically)
+- `cudaGraphLaunch()` → `replay()`
+
+#### CUDA Native API: How Graph Capture, Optimization, and Storage Works
+
+**Reference**: [PyTorch C++ CUDA Graph Implementation](https://github.com/pytorch/pytorch/blob/dc65b85d39149b95ba4ff6de4de3e2bb01f226af/aten/src/ATen/cuda/CUDAGraph.cpp)
+
+**1. `cudaStreamBeginCapture()` - Starting Capture**
+
+```cpp
+// From PyTorch C++ source (CUDAGraph.cpp)
+AT_CUDA_CHECK(cudaStreamBeginCapture(capture_stream_, capture_mode));
+```
+
+**What it does:**
+- **Puts the stream into capture mode**: All subsequent operations on this stream are recorded, not executed
+- **Creates a capture ID**: Each capture gets a unique ID to track operations
+- **Intercepts operations**: CUDA driver intercepts kernel launches, memory copies, synchronization calls
+- **Builds graph structure**: Operations are added as nodes to an internal DAG (Directed Acyclic Graph)
+
+**Key point**: Operations are **deferred** - they're recorded but not executed until replay.
+
+**2. Operations During Capture**
+
+While the stream is in capture mode:
+- **Kernel launches**: Recorded as `cudaGraphNode_t` nodes with parameters (grid/block dims, shared memory, etc.)
+- **Memory operations**: `cudaMemcpy`, allocations, etc. are recorded
+- **Synchronization**: Events, barriers are recorded as dependencies
+- **Dependencies**: CUDA tracks data flow between operations (read-after-write, write-after-read)
+
+**3. `cudaStreamEndCapture()` - Ending Capture and Creating Graph**
+
+```cpp
+// From PyTorch C++ source
+AT_CUDA_CHECK(cudaStreamEndCapture(capture_stream_, &graph_));
+```
+
+**What happens:**
+- **Finalizes the graph**: CUDA completes the `cudaGraph_t` structure (graph representation)
+- **Validates the graph**: Checks for cycles, invalid operations, etc.
+- **Returns `cudaGraph_t`**: This is the **graph structure** (not yet executable)
+
+**At this point**: We have a graph structure, but it's not optimized or executable yet.
+
+**4. `cudaGraphInstantiate()` - Optimization and Creating Executable**
+
+```cpp
+// From PyTorch C++ source
+AT_CUDA_CHECK(cudaGraphInstantiateWithFlags(&graph_exec_,
+                                            graph_,
+                                            cudaGraphInstantiateFlagAutoFreeOnLaunch | 
+                                            cudaGraphInstantiateFlagUseNodePriority));
+```
+
+**This is where optimization happens:**
+
+**a) Graph Analysis:**
+- CUDA analyzes the `cudaGraph_t` structure
+- Identifies dependencies between nodes
+- Determines which operations can run in parallel
+- Analyzes memory access patterns
+
+**b) Optimization Passes:**
+- **Kernel Scheduling**: Reorders kernels for better GPU utilization
+- **Memory Coalescing**: Groups memory accesses for efficiency
+- **Kernel Fusion**: Identifies opportunities to merge operations
+- **Register Allocation**: Optimizes register usage across kernels
+- **Pipeline Optimization**: Overlaps computation and memory transfers
+- **Node Priority**: Uses priority hints to optimize execution order
+
+**c) Code Generation:**
+- Generates optimized execution plan
+- Pre-computes all kernel launch parameters
+- Creates efficient kernel launch sequence
+- Optimizes memory access patterns
+
+**d) Creates `cudaGraphExec_t`:**
+- This is the **executable graph** (optimized execution plan)
+- Stored in GPU memory
+- Contains all pre-computed parameters
+- Ready for fast replay
+
+**5. Storage: What Gets Stored?**
+
+The optimized execution plan (`cudaGraphExec_t`) contains:
+- **Kernel sequence**: Ordered list of kernels to execute
+- **Launch parameters**: Pre-computed grid/block dimensions, shared memory configs
+- **Memory addresses**: Fixed pointers to input/output tensors (must remain valid)
+- **Dependencies**: Pre-computed dependency graph
+- **Synchronization points**: Pre-determined sync locations
+- **Memory pool reference**: Link to shared memory pool (if used)
+
+**6. `cudaGraphLaunch()` - Fast Replay**
+
+```cpp
+// From PyTorch C++ source
+AT_CUDA_CHECK(cudaGraphLaunch(graph_exec_, at::cuda::getCurrentCUDAStream()));
+```
+
+**What happens:**
+- **Single API call**: Launches the entire optimized graph
+- **No CPU overhead**: All kernel launches are pre-scheduled
+- **GPU executes directly**: GPU executes the optimized sequence without CPU intervention
+- **Fast**: Minimal latency compared to launching kernels individually
+
+**Key Insight:**
+- **Capture**: Records operations → creates `cudaGraph_t` (structure)
+- **Instantiate**: Optimizes structure → creates `cudaGraphExec_t` (executable)
+- **Launch**: Executes optimized plan → fast replay
+
+**Why This is Fast:**
+1. **Pre-computation**: All launch parameters computed once during instantiation
+2. **Optimization**: CUDA runtime optimizes the entire graph as a unit
+3. **Single Launch**: One API call launches all kernels (no per-kernel overhead)
+4. **GPU Autonomy**: GPU executes without CPU-GPU round trips
+
+**Memory Management During Capture:**
+
+```cpp
+// From PyTorch C++ source
+c10::cuda::CUDACachingAllocator::beginAllocateToPool(capture_dev_, mempool_id_, filter);
+// ... capture happens ...
+c10::cuda::CUDACachingAllocator::endAllocateToPool(capture_dev_, mempool_id_);
+```
+
+- **Memory pool**: Allocations during capture go to a special pool
+- **Pool sharing**: Multiple graphs can share the same pool (via `mempool_id_`)
+- **Fixed addresses**: Memory addresses must remain valid between replays
+
+**5. Graph Lifecycle:**
+
+```python
+# 1. Create graph object
+g = torch.cuda.CUDAGraph()
+
+# 2. Capture (PyTorch calls CUDA APIs internally)
+with torch.cuda.graph(g, pool=pool, stream=stream):
+    # Operations recorded here
+    model.forward()
+
+# 3. After context exit:
+# - CUDA calls cudaStreamEndCapture()
+# - CUDA optimizes the graph
+# - CUDA calls cudaGraphInstantiate() (creates executable)
+# - Optimized plan stored in 'g' object
+
+# 4. Replay (PyTorch calls CUDA API)
+g.replay()  # Internally calls cudaGraphLaunch()
+```
+
+**Why PyTorch Wraps CUDA APIs:**
+
+- **Safety**: Handles CUDA context management, error checking
+- **Convenience**: Pythonic interface (context manager)
+- **Memory Management**: Manages tensor lifetimes during capture
+- **Stream Management**: Handles stream creation/cleanup automatically
+- **Error Handling**: Converts CUDA errors to Python exceptions
+
+**In Mini-SGLang:**
+
+```python
+# Location: python/minisgl/engine/graph.py:152
+with torch.cuda.graph(g, pool=pool, stream=stream):
+    self.logits[:bs] = model.forward()
+```
+
+This single line:
+1. Calls PyTorch's `graph.__enter__()` → `g.capture_begin()`
+2. Records all operations in `model.forward()`
+3. Calls PyTorch's `graph.__exit__()` → `g.capture_end()`
+4. CUDA optimizes and stores the plan in `g`
+
+The complexity is hidden, but the underlying CUDA runtime does the actual optimization work.
+
 #### 1.3 Why Warm-Up? (Capture and Destroy Before Real Capture)
 
 Before capturing the graphs we actually want to keep, there's a warm-up step:
