@@ -195,7 +195,7 @@ class Engine:
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         """
-        CUDA graphs are only used for decode (not prefill).
+        CUDA graphs are only used for decode (not prefill)
         """
         assert torch.cuda.current_stream() == self.stream
         # during inference, engine checks if CUDA graph can be used

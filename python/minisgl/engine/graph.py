@@ -171,6 +171,12 @@ class GraphRunner:
         self.dummy_req = dummy_req
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
+        """
+        CUDA graphs are only used for decode (not prefill)
+        - decode phase: fixed sequence length, highly repetitive, predictable structure
+        - prefill phase: variable sequence lengths, less repetitive, harder to capture efficiently
+        """
+        # check if is decoding
         return batch.is_decode and batch.size <= self.max_graph_bs
 
     def replay(self, batch: Batch) -> torch.Tensor:
