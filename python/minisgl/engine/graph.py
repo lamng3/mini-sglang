@@ -185,7 +185,7 @@ class GraphRunner:
         g = self.graph_map[batch.padded_size]
         # update capture tensors for replay
         self.attn_backend.prepare_for_replay(batch)
-        # replay the captured graph
+        # replay the captured graph (fast CUDA graph replay)
         g.replay()
         return self.logits[: batch.size]
 

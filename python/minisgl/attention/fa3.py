@@ -139,6 +139,8 @@ class FlashAttentionBackend(BaseAttnBackend):
         assert self.capture is not None and bs in self.capture_bs
         # copy data from batch to capture tensors for replay
         # cu_seqlens_q is always [0, 1, 2, ..., bs] for decode (i.e. no-op)
+        # bottleneck: multiple copies of data between CPU and GPU
+        # each copy is a separate CUDA kernel launch
         self.capture.input_ids[:bs].copy_(batch.input_ids)
         self.capture.out_loc[:bs].copy_(batch.out_loc)
         self.capture.cu_seqlens_k[: bs + 1].copy_(metadata.cu_seqlens_k)
